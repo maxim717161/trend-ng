@@ -25,6 +25,14 @@ summ.to_csv(REPORTS / "sweep_summary.csv", index=False)
 bh = res.drop_duplicates("secid")[["secid", "buyhold"]]
 print(f"buy&hold за торговый месяц: среднее {bh.buyhold.mean():+.3f}, медиана {bh.buyhold.median():+.3f}, |среднее| {bh.buyhold.abs().mean():.3f}")
 
+full = summarize(res[res.warm_ok])
+full.to_csv(REPORTS / "sweep_summary_full_warmup.csv", index=False)
+print("\nБольшие окна (n >= 1440): все контракты (сигнал включается, когда накоплено окно) / только контракты с полным прогревом")
+big = summ[summ.n >= 1440].merge(full[["family", "n", "contracts", "net_mean", "net_median", "t_stat"]],
+                                 on=["family", "n"], how="left", suffixes=("", "_full"))
+print(big[["family", "n", "net_mean", "net_median", "t_stat", "trades_mean", "coverage",
+           "contracts_full", "net_mean_full", "net_median_full", "t_stat_full"]].round(4).to_string(index=False))
+
 print("\nЛучшие окна по каждому семейству (по среднему net на контракт):")
 best = summ.loc[summ.groupby("family")["net_mean"].idxmax()]
 print(best.round(4).to_string(index=False))
@@ -96,5 +104,5 @@ for f in FAMILIES:
     axes[1].plot(s.n, s.gross_mean, marker="o", label=f)
 for ax, t in zip(axes, ["net (после комиссии 0.05%/сторона)", "gross (до комиссии)"]):
     ax.set_xscale("log"); ax.axhline(0, color="k", lw=0.6); ax.set_title(f"средний результат за торговый месяц, {t}")
-    ax.set_xlabel("размер окна, минут"); ax.legend(); ax.set_ylim(-0.5, 0.15)
+    ax.set_xlabel("размер окна, минут"); ax.legend(); ax.set_ylim(-0.5, 0.15); ax.set_xlim(4, 20000)
 fig.tight_layout(); fig.savefig(REPORTS / "window_sizes.png", dpi=110)

@@ -17,9 +17,11 @@ import pandas as pd
 
 DATA = Path(__file__).resolve().parent.parent / "data" / "minute"
 FEE = 0.0005
-WINDOWS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360, 480, 600, 720, 840, 960, 1200, 1440, 1920, 2880]
-# EMA-кросс использует медленную среднюю 4N, ей нужен прогрев ~ несколько N: ограничиваем N<=1440
-MAX_WINDOW = {"donchian": 2880, "momentum": 2880, "ema_cross": 1440}
+WINDOWS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360, 480, 600, 720, 840, 960, 1200, 1440, 1920,
+           2880, 3600, 4320, 5760, 7200, 8640, 10080, 12000, 15000]
+# Сигнал включается только когда накоплено достаточно баров для окна (иначе позиция 0):
+# donchian/momentum - n+1 баров, ema_cross - SLOW_MULT*n баров (медленная EMA).
+# Если месяца прогрева не хватает, стратегия начинает торговать позже внутри торгового месяца.
 FAMILIES = ("donchian", "ema_cross", "momentum")
 SLOW_MULT = 4  # slow EMA = SLOW_MULT * fast
 
@@ -72,13 +74,18 @@ def signal(family: str, close: np.ndarray, n: int) -> np.ndarray:
     raise ValueError(family)
 
 
+def lookback(family: str, n: int) -> int:
+    return SLOW_MULT * n if family == "ema_cross" else n + 1
+
+
 def backtest(ct: Contract, family: str, n: int, fee: float = FEE) -> dict:
     b = ct.bars
     o, c = b["open"].to_numpy(), b["close"].to_numpy()
     ts = b.index
     sig = signal(family, c, n)
     in_trade = ts >= ct.trade_start
-    sig = np.where(in_trade, sig, 0.0)
+    ready = np.arange(len(c)) + 1 >= lookback(family, n)
+    sig = np.where(in_trade & ready, sig, 0.0)
     # позиция, действующая в баре t: сигнал t-1 (исполнение по open t)
     pos_new = np.r_[0.0, sig[:-1]]
     pos_new[-1] = 0.0  # закрытие по open последнего бара
@@ -98,6 +105,8 @@ def backtest(ct: Contract, family: str, n: int, fee: float = FEE) -> dict:
         "net": (gross - cost)[m].sum(),
         "trades": int(((turnover > 0) & m).sum()),
         "bars": int(m.sum()),
+        "coverage": float(ready[m].mean()),
+        "warm_ok": bool(ready[np.argmax(in_trade)]),
         "pnl": pd.Series((gross - cost)[m], index=ts[m]),
     }
 
@@ -108,11 +117,12 @@ def sweep(contracts: list[Contract], windows=WINDOWS, families=FAMILIES) -> pd.D
         bh = ct.bars.loc[ct.trade_start:]
         buyhold = bh["close"].iloc[-1] / bh["open"].iloc[0] - 1
         for f in families:
-            for n in [w for w in windows if w <= MAX_WINDOW[f]]:
+            for n in windows:
                 r = backtest(ct, f, n)
                 rows.append({"secid": ct.secid, "expiry": ct.expiry, "family": f, "n": n,
                              "gross": r["gross"], "fees": r["fees"], "net": r["net"],
-                             "trades": r["trades"], "bars": r["bars"], "buyhold": buyhold})
+                             "trades": r["trades"], "bars": r["bars"], "coverage": r["coverage"],
+                             "warm_ok": r["warm_ok"], "buyhold": buyhold})
     return pd.DataFrame(rows)
 
 
@@ -120,6 +130,6 @@ def summarize(res: pd.DataFrame) -> pd.DataFrame:
     g = res.groupby(["family", "n"])
     s = g.agg(contracts=("net", "size"), net_mean=("net", "mean"), net_median=("net", "median"),
               net_std=("net", "std"), gross_mean=("gross", "mean"), fees_mean=("fees", "mean"),
-              trades_mean=("trades", "mean"), win_rate=("net", lambda x: (x > 0).mean()))
+              trades_mean=("trades", "mean"), coverage=("coverage", "mean"), win_rate=("net", lambda x: (x > 0).mean()))
     s["t_stat"] = s["net_mean"] / (s["net_std"] / np.sqrt(s["contracts"]))
     return s.reset_index()
