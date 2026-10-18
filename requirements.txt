@@ -4,3 +4,4 @@ requests
 pyarrow
 matplotlib
 scipy
+xlrd

@@ -23,7 +23,7 @@ gid = {s: k + 1 for k, g in enumerate(groups) for s in g}
 
 
 def trade_returns_15m(ct: Contract) -> np.ndarray:
-    o, c, it = resample(ct, 15)
+    o, c, it, _ = resample(ct, 15)
     r = np.diff(np.log(c))[it[1:]]
     return r
 
@@ -85,7 +85,7 @@ pd.DataFrame(rows).to_csv(REPORTS / "trend_daily_acf.csv", index=False)
 
 print("\n== 3. Efficiency ratio торгового месяца (1ч бары): реальные vs суррогаты (перемешанные дни) ==")
 def er_month(ct: Contract) -> float:
-    o, c, it = resample(ct, 60)
+    o, c, it, _ = resample(ct, 60)
     x = np.log(c[it])
     return abs(x[-1] - x[0]) / np.abs(np.diff(x)).sum()
 real_er = np.array([er_month(c) for c in cts])
@@ -96,7 +96,7 @@ print(f"средний ER реальный {real_er.mean():.4f}; суррога�
 print("\n== 4. Сезонность: доходность buy&hold за торговый месяц по контрактам ==")
 rows = []
 for ct in cts:
-    o, c, it = resample(ct, 60)
+    o, c, it, _ = resample(ct, 60)
     rows.append({"secid": ct.secid, "group": gid[ct.secid], "месяц экспирации": ct.expiry.month,
                  "buyhold": c[it][-1] / o[it][0] - 1, "ER": er_month(ct)})
 sd = pd.DataFrame(rows)

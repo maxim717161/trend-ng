@@ -9,6 +9,11 @@
   n       - размер окна в минутах (<= MAX_WINDOW)
   step    - шаг принятия решений в минутах (стратегия считается на барах step минут)
   er      - порог efficiency ratio окна: при ER ниже порога позиция 0 (0 = фильтр выключен)
+  bias    - фильтр по запасам газа EIA: none / dev4 / level (торгуем тренд только в сторону bias, иначе 0);
+            семейство storage торгует сам bias без трендового сигнала
+            dev4:  bias = -sign(сумма за 4 недели отклонений недельной инъекции от среднего за 5 лет)
+            level: bias = -sign(запасы относительно среднего за 5 лет), дефицит -> лонг
+            Используются только данные, уже опубликованные на момент бара.
 Сигнал по закрытию бара исполняется по open следующего бара. Комиссия 0.05% за сторону.
 Окно включается, когда накоплено достаточно баров (иначе позиция 0, см. coverage).
 """
@@ -20,6 +25,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import eia
+
 DATA = Path(__file__).resolve().parent.parent / "data" / "minute"
 FEE = 0.0005
 WARM_MONTHS = 4
@@ -27,6 +34,7 @@ MAX_WINDOW = 10_000
 WINDOWS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, 960, 1440, 1920, 2880, 4320, 5760, 7200, 10000]
 STEPS = [1, 5, 15, 30, 60, 120, 240]
 FAMILIES = ("donchian", "ema_cross", "momentum")
+BIASES = ("none", "dev4", "level")
 ER_LEVELS = (0.0, 0.2)
 FAST_DIV = 4
 MIN_BARS_PER_WINDOW = 4  # окно должно содержать хотя бы столько баров решения
@@ -65,15 +73,15 @@ def split_groups(contracts: list[Contract], k: int = 5) -> list[list[str]]:
     return [[c.secid for c in part] for part in np.array_split(np.array(contracts, dtype=object), k)]
 
 
-def resample(ct: Contract, step: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Бары по step минут: open, close, признак торговой части."""
+def resample(ct: Contract, step: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Бары по step минут: open, close, признак торговой части, индекс первой минуты бара."""
     if step == 1:
-        return ct.o, ct.c, ct.in_trade
+        return ct.o, ct.c, ct.in_trade, np.arange(len(ct.c))
     key = ct.ts.floor(f"{step}min").asi8
     change = np.r_[True, key[1:] != key[:-1]]
     first = np.flatnonzero(change)
     last = np.r_[first[1:] - 1, len(key) - 1]
-    return ct.o[first], ct.c[last], ct.ts[first] >= ct.trade_start
+    return ct.o[first], ct.c[last], ct.ts[first] >= ct.trade_start, first
 
 
 def make_surrogate(ct: Contract, rng: np.random.Generator) -> Contract:
@@ -91,6 +99,35 @@ def make_surrogate(ct: Contract, rng: np.random.Generator) -> Contract:
     c = ct.c[0] * np.cumprod((1 + g) * (1 + r))
     o = np.r_[ct.c[0], c[:-1]] * (1 + g)
     return Contract(ct.secid, ct.expiry, ct.trade_start, ct.ts, o, c)
+
+
+_STORAGE = None
+_SHIFT = 0  # для нулевой модели: циклический сдвиг ряда запасов по неделям
+
+
+def set_bias_shift(k: int) -> None:
+    global _SHIFT
+    _SHIFT = k
+
+
+def bias_array(ts: pd.DatetimeIndex, kind: str) -> np.ndarray:
+    """Знак позиции по запасам газа на каждую минуту (по последней уже опубликованной неделе)."""
+    global _STORAGE
+    if kind == "none":
+        return np.zeros(len(ts))
+    if _STORAGE is None:
+        st = eia.load().sort_values("release_msk").reset_index(drop=True)
+        st["dev4"] = st["dev_change"].rolling(4).sum()
+        _STORAGE = st
+    st = _STORAGE
+    val = (st["dev4"] if kind == "dev4" else st["dev_pct"]).to_numpy().copy()
+    if _SHIFT:
+        ok = ~np.isnan(val)
+        val[ok] = np.roll(val[ok], _SHIFT)
+    sgn = -np.sign(val)
+    sgn = np.nan_to_num(sgn)
+    idx = np.searchsorted(st["release_msk"].to_numpy(), ts.to_numpy(), side="right") - 1
+    return np.where(idx >= 0, sgn[np.clip(idx, 0, None)], 0.0)
 
 
 def _ema(x: np.ndarray, span: int) -> np.ndarray:
@@ -118,11 +155,18 @@ def efficiency_ratio(c: np.ndarray, m: int) -> np.ndarray:
     return ((s - s.shift(m)).abs() / path).to_numpy()
 
 
-def run(o: np.ndarray, c: np.ndarray, in_trade: np.ndarray, family: str, m: int, er: float, fee: float = FEE) -> dict:
-    sig = raw_signal(family, c, m)
-    if er > 0:
-        sig = np.where(efficiency_ratio(c, m) >= er, sig, 0.0)
-    ready = np.arange(len(c)) + 1 >= (m if family == "ema_cross" else m + 1)
+def run(o: np.ndarray, c: np.ndarray, in_trade: np.ndarray, family: str, m: int, er: float,
+        bias: np.ndarray | None = None, fee: float = FEE) -> dict:
+    if family == "storage":
+        sig = bias.copy()
+        ready = np.ones(len(c), dtype=bool)
+    else:
+        sig = raw_signal(family, c, m)
+        if er > 0:
+            sig = np.where(efficiency_ratio(c, m) >= er, sig, 0.0)
+        if bias is not None:
+            sig = np.where(sig == bias, sig, 0.0)
+        ready = np.arange(len(c)) + 1 >= (m if family == "ema_cross" else m + 1)
     sig = np.where(in_trade & ready, sig, 0.0)
     pos_new = np.r_[0.0, sig[:-1]]
     pos_new[-1] = 0.0
@@ -136,7 +180,7 @@ def run(o: np.ndarray, c: np.ndarray, in_trade: np.ndarray, family: str, m: int,
             "trades": int(((turnover > 0) & mk).sum()), "coverage": float(ready[mk].mean())}
 
 
-def config_grid() -> list[tuple[str, int, int, float]]:
+def config_grid(storage: bool = True) -> list[tuple[str, int, int, float, str]]:
     grid = []
     for f in FAMILIES:
         for step in STEPS:
@@ -144,7 +188,13 @@ def config_grid() -> list[tuple[str, int, int, float]]:
                 if n > MAX_WINDOW or n // step < MIN_BARS_PER_WINDOW:
                     continue
                 for er in ER_LEVELS:
-                    grid.append((f, n, step, er))
+                    grid.append((f, n, step, er, "none"))
+                if storage:
+                    for b in BIASES[1:]:
+                        grid.append((f, n, step, 0.0, b))
+    if storage:
+        for b in BIASES[1:]:
+            grid.append(("storage", 0, 60, 0.0, b))
     return grid
 
 
@@ -155,12 +205,14 @@ def evaluate(contracts: list[Contract], grid=None, fee: float = FEE, detail: boo
     net = np.zeros((len(contracts), len(grid)))
     for i, ct in enumerate(contracts):
         cache = {s: resample(ct, s) for s in sorted({g[2] for g in grid})}
-        for j, (f, n, step, er) in enumerate(grid):
-            o, c, it = cache[step]
-            r = run(o, c, it, f, n // step, er, fee)
+        biases = {b: bias_array(ct.ts, b) for b in BIASES}
+        for j, (f, n, step, er, b) in enumerate(grid):
+            o, c, it, first = cache[step]
+            ba = None if b == "none" else biases[b][first]
+            r = run(o, c, it, f, n // step, er, ba, fee)
             net[i, j] = r["net"]
             if detail:
-                rows.append({"secid": ct.secid, "family": f, "n": n, "step": step, "er": er, **r})
+                rows.append({"secid": ct.secid, "family": f, "n": n, "step": step, "er": er, "bias": b, **r})
     return pd.DataFrame(rows) if detail else net
 
 
