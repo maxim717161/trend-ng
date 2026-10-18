@@ -9,11 +9,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from study import config_grid, evaluate, group_stats, load_contracts, make_surrogate, split_groups
+from nulls import NULLS
+from study import config_grid, evaluate, group_stats, load_contracts, split_groups
 
 REPORTS = Path(__file__).resolve().parent.parent / "reports"
 REPORTS.mkdir(exist_ok=True)
 N_SURR = int(sys.argv[1]) if len(sys.argv) > 1 else 100
+NULL = sys.argv[2] if len(sys.argv) > 2 else "dayblock"   # dayblock | signflip
+make_surrogate = NULLS[NULL]
 
 CTS = load_contracts()
 GRID = config_grid()
@@ -62,7 +65,8 @@ if __name__ == "__main__":
     agg = detail.groupby(["family", "n", "step", "er", "bias"]).agg(
         trades=("trades", "mean"), gross=("gross", "mean"), fees=("fees", "mean"), coverage=("coverage", "mean")).reset_index()
     res = res.merge(agg, on=["family", "n", "step", "er", "bias"])
-    res.to_csv(REPORTS / "search_results.csv", index=False)
+    if NULL == "dayblock":
+        res.to_csv(REPORTS / "search_results.csv", index=False)
 
     print("Группы:", [f"{g[0]}..{g[-1]}({len(g)})" for g in GROUPS])
     print(f"конфигураций: {len(GRID)}; плюс в >=4 группах: {(res.plus_groups >= 4).sum()}; в 5 группах: {(res.plus_groups == 5).sum()}")
@@ -71,10 +75,10 @@ if __name__ == "__main__":
     print("\nКонфигурации с плюсом в >=4 группах из 5 (по net_mean):")
     print(res[res.plus_groups >= 4].sort_values("net_mean", ascending=False)[cols].head(40).round(4).to_string(index=False))
 
-    print(f"\nСуррогаты (перемешанные дни, {N_SURR} шт.): сколько конфигураций проходит критерий случайно")
+    print(f"\nСуррогаты ({NULL}, {N_SURR} шт.): сколько конфигураций проходит критерий случайно")
     with Pool(4) as p:
         sur = pd.DataFrame(p.map(surrogate_run, range(1000, 1000 + N_SURR)))
-    sur.to_csv(REPORTS / "surrogates.csv", index=False)
+    sur.to_csv(REPORTS / ("surrogates.csv" if NULL == "dayblock" else f"surrogates_{NULL}.csv"), index=False)
     real = {"n4": int((s["plus"] >= 4).sum()), "n5": int((s["plus"] == 5).sum()),
             "n4_storage": int(((s["plus"] >= 4) & IS_STORAGE).sum()),
             "best_mean": float(s["mean"].max()), "best_mean_storage": float(s["mean"][IS_STORAGE].max()),
