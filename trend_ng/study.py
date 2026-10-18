@@ -1,7 +1,7 @@
 """Подбор размера окна трендовой стратегии на NGM (минутки, контракты не склеиваются).
 
 Схема для каждого завершённого контракта отдельно:
-  [экспирация-2м, экспирация-1м)  - прогрев: индикаторы считаются, позиции нет
+  [экспирация-WARM_MONTHS, экспирация-1м) - прогрев: индикаторы считаются, позиции нет
   [экспирация-1м, экспирация]     - торговля; на последней минуте позиция закрывается
 
 Сигнал по закрытию бара t исполняется по open бара t+1. Комиссия 0.05% от номинала
@@ -19,11 +19,13 @@ DATA = Path(__file__).resolve().parent.parent / "data" / "minute"
 FEE = 0.0005
 WINDOWS = [5, 10, 15, 20, 30, 45, 60, 90, 120, 150, 180, 240, 300, 360, 480, 600, 720, 840, 960, 1200, 1440, 1920,
            2880, 3600, 4320, 5760, 7200, 8640, 10080, 12000, 15000]
-# Сигнал включается только когда накоплено достаточно баров для окна (иначе позиция 0):
-# donchian/momentum - n+1 баров, ema_cross - SLOW_MULT*n баров (медленная EMA).
-# Если месяца прогрева не хватает, стратегия начинает торговать позже внутри торгового месяца.
+# Прогрев в месяцах до торгового месяца. Выбран так, чтобы минуток хватало на самое большое окно.
+WARM_MONTHS = 4
+# Для контракта нужен прогрев не меньше max(WINDOWS)+1 минутных баров; иначе контракт исключается,
+# чтобы все окна сравнивались на одном и том же наборе контрактов.
+MIN_WARM_BARS = max(WINDOWS) + 1
 FAMILIES = ("donchian", "ema_cross", "momentum")
-SLOW_MULT = 4  # slow EMA = SLOW_MULT * fast
+FAST_DIV = 4  # ema_cross: n - период медленной EMA, быстрая = n // FAST_DIV (минимум 2)
 
 
 @dataclass
@@ -35,7 +37,8 @@ class Contract:
     bars: pd.DataFrame  # индекс - begin; open/high/low/close/volume
 
 
-def load_contracts(min_warm_days: int = 25) -> list[Contract]:
+def load_contracts(warm_months: int = WARM_MONTHS, min_warm_bars: int = MIN_WARM_BARS,
+                   verbose: bool = False) -> list[Contract]:
     files = sorted(DATA.glob("*_1m.parquet"))
     raw = {p.name.split("_")[0]: pd.read_parquet(p).set_index("begin") for p in files}
     last_ts = max(df.index.max() for df in raw.values())
@@ -45,11 +48,13 @@ def load_contracts(min_warm_days: int = 25) -> list[Contract]:
             continue  # контракт ещё торгуется
         expiry = df.index.max().normalize()
         trade_start = expiry - pd.DateOffset(months=1)
-        warm_start = expiry - pd.DateOffset(months=2)
-        if df.index.min() > warm_start + pd.Timedelta(days=30 - min_warm_days):
-            continue  # нет полного месяца прогрева
-        sl = df.loc[warm_start:]
-        out.append(Contract(secid, expiry, warm_start, trade_start, sl))
+        warm_start = expiry - pd.DateOffset(months=warm_months)
+        n_warm = len(df.loc[warm_start:trade_start - pd.Timedelta(minutes=1)])
+        if n_warm < min_warm_bars:
+            if verbose:
+                print(f"  исключён {secid}: в прогреве {n_warm} баров < {min_warm_bars}")
+            continue
+        out.append(Contract(secid, expiry, warm_start, trade_start, df.loc[warm_start:]))
     return sorted(out, key=lambda c: c.expiry)
 
 
@@ -68,14 +73,14 @@ def signal(family: str, close: np.ndarray, n: int) -> np.ndarray:
         s[c < lo] = -1.0
         return s.ffill().fillna(0.0).to_numpy()
     if family == "ema_cross":
-        return np.sign(_ema(close, n) - _ema(close, SLOW_MULT * n))
+        return np.sign(_ema(close, max(2, n // FAST_DIV)) - _ema(close, n))
     if family == "momentum":
         return np.nan_to_num(np.sign(close - c.shift(n).to_numpy()))
     raise ValueError(family)
 
 
 def lookback(family: str, n: int) -> int:
-    return SLOW_MULT * n if family == "ema_cross" else n + 1
+    return n if family == "ema_cross" else n + 1
 
 
 def backtest(ct: Contract, family: str, n: int, fee: float = FEE) -> dict:

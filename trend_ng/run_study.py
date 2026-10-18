@@ -8,15 +8,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from study import FAMILIES, backtest, load_contracts, summarize, sweep
+from study import FAMILIES, MIN_WARM_BARS, WARM_MONTHS, backtest, load_contracts, summarize, sweep
 
+MIN_TRAIN = 5
 REPORTS = Path(__file__).resolve().parent.parent / "reports"
 REPORTS.mkdir(exist_ok=True)
 pd.set_option("display.width", 250)
 pd.set_option("display.max_columns", 30)
 
-cts = load_contracts()
-print(f"контрактов: {len(cts)}: {cts[0].secid} .. {cts[-1].secid}")
+cts = load_contracts(verbose=True)
+print(f"прогрев {WARM_MONTHS} мес., минимум {MIN_WARM_BARS} баров; контрактов: {len(cts)}: {[c.secid for c in cts]}")
 res = sweep(cts)
 res.to_csv(REPORTS / "sweep_by_contract.csv", index=False)
 summ = summarize(res)
@@ -25,13 +26,9 @@ summ.to_csv(REPORTS / "sweep_summary.csv", index=False)
 bh = res.drop_duplicates("secid")[["secid", "buyhold"]]
 print(f"buy&hold за торговый месяц: среднее {bh.buyhold.mean():+.3f}, медиана {bh.buyhold.median():+.3f}, |среднее| {bh.buyhold.abs().mean():.3f}")
 
-full = summarize(res[res.warm_ok])
-full.to_csv(REPORTS / "sweep_summary_full_warmup.csv", index=False)
-print("\nБольшие окна (n >= 1440): все контракты (сигнал включается, когда накоплено окно) / только контракты с полным прогревом")
-big = summ[summ.n >= 1440].merge(full[["family", "n", "contracts", "net_mean", "net_median", "t_stat"]],
-                                 on=["family", "n"], how="left", suffixes=("", "_full"))
-print(big[["family", "n", "net_mean", "net_median", "t_stat", "trades_mean", "coverage",
-           "contracts_full", "net_mean_full", "net_median_full", "t_stat_full"]].round(4).to_string(index=False))
+print("\nБольшие окна (n >= 1440):")
+print(summ[summ.n >= 1440][["family", "n", "net_mean", "net_median", "t_stat", "trades_mean", "coverage", "win_rate"]]
+      .round(4).to_string(index=False))
 
 print("\nЛучшие окна по каждому семейству (по среднему net на контракт):")
 best = summ.loc[summ.groupby("family")["net_mean"].idxmax()]
@@ -53,14 +50,14 @@ for f in FAMILIES:
           f"лучшее на B = {b.idxmax()} (B {b.max():+.3f}, A {a[b.idxmax()]:+.3f})")
 
 # 2) walk-forward: на каждом контракте выбираем окно по среднему net предыдущих контрактов
-print("\nWalk-forward (расширяющаяся выборка, минимум 8 контрактов обучения):")
+print(f"\nWalk-forward (расширяющаяся выборка, минимум {MIN_TRAIN} контрактов обучения):")
 piv = res.pivot_table(index="secid", columns=["family", "n"], values="net")
 piv = piv.loc[[c.secid for c in cts]]
 wf_rows = []
 for fam in list(FAMILIES) + ["all"]:
     cols = [c for c in piv.columns if fam == "all" or c[0] == fam]
     out = []
-    for k in range(8, len(piv)):
+    for k in range(MIN_TRAIN, len(piv)):
         train = piv.iloc[:k][cols].mean()
         pick = train.idxmax()
         out.append((piv.index[k], pick, piv.iloc[k][pick]))
