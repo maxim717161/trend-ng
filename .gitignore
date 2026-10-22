@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 data/
+trader_local/
+build/
+report_*.csv

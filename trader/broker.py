@@ -1,0 +1,33 @@
+"""Интерфейс брокера. Боевой адаптер - tinvest.TInvestBroker, симулятор - paper.PaperBroker."""
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Protocol
+
+from trader.models import Bar, Book, Instrument, OrderState
+
+
+class OrderNotFound(Exception):
+    pass
+
+
+class Broker(Protocol):
+    def list_futures(self) -> list[Instrument]: ...
+
+    def hourly_bars(self, inst: Instrument, now: datetime, n: int) -> list[Bar]: ...
+
+    def book(self, inst: Instrument) -> Book: ...
+
+    def is_trading(self, inst: Instrument) -> bool: ...
+
+    def position(self, inst: Instrument) -> int: ...
+
+    def equity(self) -> float: ...
+
+    def place_limit(self, inst: Instrument, req_id: str, side: int, qty: int, price: float) -> OrderState: ...
+
+    def find_active(self, inst: Instrument, req_id: str) -> OrderState | None: ...
+
+    def order_state(self, inst: Instrument, order_id: str) -> OrderState: ...
+
+    def cancel(self, inst: Instrument, order_id: str) -> None: ...
